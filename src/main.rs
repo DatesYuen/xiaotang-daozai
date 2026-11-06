@@ -121,6 +121,7 @@ impl Shell {
         let initial_input=None;
         #[cfg(windows)]
         let hid_service=daozai::hid::Service::spawn(app.settings.hid_battery);
+        #[cfg(windows)] hid_service.set_intervals(&app.settings.hid_refresh_seconds);
         #[cfg(windows)] let system_state=daozai::system::Snapshot::default();
         #[cfg(windows)] let system_rx=daozai::system::observe(cc.egui_ctx.clone(),system_state.clone(),initial_input);
         // 岛体大小只作用于主窗口，在首帧之前生效，避免启动时先按 100% 闪一下。
@@ -378,6 +379,7 @@ impl eframe::App for Shell {
             }
             // 【新增】独立接收 HID 结果，关闭蓝牙不会停止 HID 电量采集。
             self.hid_service.set_enabled(self.app.settings.hid_battery);
+            self.hid_service.set_intervals(&self.app.settings.hid_refresh_seconds);
             while let Ok(found)=self.hid_service.rx.try_recv(){self.hid_snapshot=found;}
             let wechat_enabled=self.app.settings.wechat_notifications && self.app.settings.notifications;
             if self.wechat.as_ref().is_some_and(|listener|!listener.registered()){self.wechat=None;}

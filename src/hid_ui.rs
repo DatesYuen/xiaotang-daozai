@@ -27,7 +27,7 @@ impl State {
         ui.label(egui::RichText::new("设备电量与 HID 反馈").strong());
         ui.label("查看本机、蓝牙及 HID 外设。读不到电量时，可生成兼容性报告帮助维护者适配。");
         ui.checkbox(enabled, "启用 HID 外设电量采集");
-        ui.small("每分钟刷新；标准 HID 电池字段优先，已知协议补充读取。未知设备仅采集接口结构。");
+        ui.small("2.4G 默认 5s，可在上方逐设备调整；其他 HID 每分钟刷新。未知设备仅采集接口结构。");
         ui.add_space(5.0);
         let host = self
             .host
@@ -84,7 +84,7 @@ impl State {
             .max_height(180.0)
             .show(ui, |ui| {
                 for device in &self.snapshot.devices {
-                    let status = if stale {
+                    let status = if self.snapshot.device_stale_at(&device.id, now) {
                         "读数已过期，请刷新".into()
                     } else {
                         match device.battery {

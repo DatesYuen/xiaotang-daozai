@@ -1,11 +1,13 @@
 //! 【新增】与品牌解耦的 HID 电量快照、协议能力与本地反馈。
 //! 平台层只负责 I/O，协议层只发送已知的电量查询；未知接口仅描述，不探测私有命令。
 
+mod polling;
 mod protocols;
 mod service;
 #[cfg(windows)]
 mod windows;
 
+pub use polling::{refresh_seconds, DEFAULT_REFRESH_SECS, MAX_REFRESH_SECS};
 use serde_json::{json, Value};
 pub use service::Service;
 
@@ -164,6 +166,13 @@ pub struct Device {
     pub failure: Option<Failure>,
 }
 
+/// 【新增】缓存读数保留实际采样时刻，不能因另一台设备刷新而假装重新采样。
+#[derive(Clone, Copy, Debug)]
+pub struct Sample {
+    pub collected_at: u64,
+    pub interval_seconds: u32,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub devices: Vec<Device>,
@@ -171,11 +180,26 @@ pub struct Snapshot {
     pub generation: u64,
     pub error: Option<Failure>,
     pub truncated: bool,
+    pub samples: std::collections::BTreeMap<String, Sample>,
 }
 impl Snapshot {
     /// 【新增】服务/驱动长期未返回时，界面不继续把旧读数显示成当前电量。
     pub fn stale_at(&self, now: u64) -> bool {
         self.collected_at > 0 && now.saturating_sub(self.collected_at) > 120
+    }
+    /// 【新增】自定义长间隔允许两个采样周期，后台整体失联仍按 120 秒判断。
+    pub fn device_stale_at(&self, id: &str, now: u64) -> bool {
+        if self.stale_at(now) {
+            return true;
+        }
+        self.samples.get(id).is_some_and(|s| {
+            s.collected_at > 0
+                && now.saturating_sub(s.collected_at)
+                    > u64::from(s.interval_seconds)
+                        .saturating_mul(2)
+                        .saturating_add(12)
+                        .max(120)
+        })
     }
 }
 
@@ -199,6 +223,9 @@ pub fn feedback(snapshot: &Snapshot) -> String {
             "value_cap_counts":d.descriptor.value_caps,"button_cap_counts":d.descriptor.button_caps,
             "fields":fields,"fields_truncated":d.descriptor.fields_truncated,"descriptor_error":d.descriptor.error.map(Failure::code),
             "protocol":d.protocol,"transport":d.transport,"receiver_slot":d.slot,
+            "sampled_at_unix":snapshot.samples.get(&d.id).map_or(snapshot.collected_at,|s|s.collected_at),
+            "refresh_seconds":snapshot.samples.get(&d.id).map(|s|s.interval_seconds),
+            "stale":snapshot.device_stale_at(&d.id,now),
             "battery":d.battery.map(|b|json!({"percent":b.percent,"charging":b.charging,"millivolts":b.millivolts})),
             "failure":d.failure.map(Failure::code)})
     }).collect();
@@ -282,6 +309,33 @@ mod tests {
         assert!(!snapshot.stale_at(99));
         assert!(!snapshot.stale_at(220));
         assert!(snapshot.stale_at(221));
+    }
+    #[test]
+    fn device_age_respects_custom_interval_and_other_device_refreshes() {
+        let mut snapshot = Snapshot {
+            collected_at: 1000,
+            ..Default::default()
+        };
+        snapshot.samples.insert(
+            "slow".into(),
+            Sample {
+                collected_at: 800,
+                interval_seconds: 300,
+            },
+        );
+        snapshot.samples.insert(
+            "old".into(),
+            Sample {
+                collected_at: 100,
+                interval_seconds: 5,
+            },
+        );
+        assert!(!snapshot.device_stale_at("slow", 1000));
+        assert!(snapshot.device_stale_at("old", 1000));
+        assert!(
+            snapshot.device_stale_at("slow", 1121),
+            "整个采集线程失联不能继续显示缓存"
+        );
     }
     #[test]
     fn feedback_excludes_names_ids_and_raw_input() {

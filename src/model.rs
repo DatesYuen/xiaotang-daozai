@@ -202,12 +202,16 @@ pub struct Settings {
     pub visible_pages: [bool; 9],
     pub page_order: [usize; 9],
     pub show_battery: bool,
+    /// 【新增】开启后无有效设备读数也保留灰色电量环，仍受岛上电量总开关控制。
+    pub battery_pinned: bool,
     /// 【新增】空串为自动选择；设备标识仅保存在本地，不进入兼容性报告。
     pub battery_device: String,
     /// 【新增】设备标识 →（自定义名称，是否在设备电量页显示）；重连后恢复偏好。
     pub battery_devices: std::collections::BTreeMap<String, (String, bool)>,
     /// 【新增】独立 HID 开关；蓝牙通知开关不再承担所有外设的采集控制。
     pub hid_battery: bool,
+    /// 【新增】按本地设备标识保存 2.4G 刷新秒数，缺省 5 秒。
+    pub hid_refresh_seconds: std::collections::BTreeMap<String,u32>,
     pub clock_12h: bool,
     pub clock_period: u8,
     pub resident_order: Vec<usize>,
@@ -248,7 +252,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 9], page_order: [0,1,2,3,4,5,6,7,8], show_battery: true, battery_device: String::new(), battery_devices: Default::default(), hid_battery: true, clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, mail_enabled: true, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true }
+        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 9], page_order: [0,1,2,3,4,5,6,7,8], show_battery: true, battery_pinned: false, battery_device: String::new(), battery_devices: Default::default(), hid_battery: true, hid_refresh_seconds: Default::default(), clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, mail_enabled: true, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true }
     }
 }
 
@@ -314,9 +318,11 @@ impl Settings {
                 "clock_period" => s.clock_period = v.parse::<u8>().ok().filter(|v|*v<=2).unwrap_or(0),
                 "clock_12h" => s.clock_12h = v == "1",
                 "show_battery" => s.show_battery = v != "0",
+                "battery_pinned" => s.battery_pinned = v == "1",
                 "battery_device" => s.battery_device = v,
                 "battery_devices" => s.battery_devices = serde_json::from_str(&v).unwrap_or_default(),
                 "hid_battery" => s.hid_battery = v != "0",
+                "hid_refresh_seconds" => s.hid_refresh_seconds = serde_json::from_str::<std::collections::BTreeMap<String,u32>>(&v).unwrap_or_default().into_iter().map(|(id,secs)|(id,crate::hid::refresh_seconds(secs))).collect(),
                 "visible_pages" if (6..=9).contains(&v.len()) && v.bytes().all(|b| b==b'0' || b==b'1') => {
                     for (enabled,value) in s.visible_pages.iter_mut().zip(v.bytes()) { *enabled=value==b'1'; }
                     for enabled in &mut s.visible_pages[v.len()..]{*enabled=v.bytes().any(|b|b==b'1');}
@@ -379,9 +385,11 @@ impl Settings {
                 ("clock_period".into(), self.clock_period.to_string()),
                 ("clock_12h".into(), (self.clock_12h as u8).to_string()),
                 ("show_battery".into(), (self.show_battery as u8).to_string()),
+                ("battery_pinned".into(), (self.battery_pinned as u8).to_string()),
                 ("battery_device".into(), self.battery_device.clone()),
                 ("battery_devices".into(), serde_json::to_string(&self.battery_devices).unwrap_or_default()),
                 ("hid_battery".into(), (self.hid_battery as u8).to_string()),
+                ("hid_refresh_seconds".into(), serde_json::to_string(&self.hid_refresh_seconds).unwrap_or_default()),
                 ("read_notifications".into(),(self.read_notifications as u8).to_string()),
                 ("wechat_notifications".into(),(self.wechat_notifications as u8).to_string()),
                 ("wechat_tray_open".into(),(self.wechat_tray_open as u8).to_string()),

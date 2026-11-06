@@ -75,8 +75,8 @@ impl State {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let stale = env.hid.stale_at(now);
         for d in &env.hid.devices {
+            let stale = env.hid.device_stale_at(&d.id, now);
             // 【新增】未识别的普通 HID 接口留在反馈详情，避免键鼠的每个集合都变成电池。
             if d.protocol == "unknown"
                 && d.battery.is_none()
@@ -146,9 +146,20 @@ impl State {
         crate::extras::setting_row(
             ui,
             "岛上电量",
-            "与「页面管理 → 电量」同步；无有效读数时自动隐藏。",
+            "与「页面管理 → 电量」同步，控制岛上的电量显示。",
             &mut settings.show_battery,
         );
+        // 【新增】开启常驻时同时开启总开关；关闭总开关仍可暂时隐藏所有电量显示。
+        let was_pinned = settings.battery_pinned;
+        crate::extras::setting_row(
+            ui,
+            "常驻岛上",
+            "无设备或电量未知时，也保留一个灰色电量环。",
+            &mut settings.battery_pinned,
+        );
+        if settings.battery_pinned && !was_pinned {
+            settings.show_battery = true;
+        }
         ui.add_space(5.0);
         let selected = if settings.battery_device.is_empty() {
             "自动选择（本机优先）".into()
@@ -211,7 +222,13 @@ impl State {
                                     .char_limit(48),
                             )
                             .changed();
-                        ui.small(format!("{} · {}", d.source, d.level()));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.small(format!("{} · {}", d.source, d.level()));
+                            // 【新增】2.4G 的采样间隔单独配置；不改变其他 HID / 蓝牙 / 本机的轮询。
+                            if d.source == "2.4G" {
+                                refresh_interval_ui(ui, settings, &d.id);
+                            }
+                        });
                     });
                 });
                 if changed {
@@ -251,7 +268,64 @@ impl State {
     }
 }
 
+fn refresh_interval_ui(ui: &mut egui::Ui, settings: &mut Settings, id: &str) {
+    const PRESETS: [u32; 6] = [5, 10, 15, 30, 60, 120];
+    let mut seconds = settings
+        .hid_refresh_seconds
+        .get(id)
+        .copied()
+        .unwrap_or(crate::hid::DEFAULT_REFRESH_SECS);
+    let before = seconds;
+    let custom_id = ui.id().with("hid-custom-interval");
+    let mut custom = ui.ctx().data(|d| {
+        d.get_temp::<bool>(custom_id)
+            .unwrap_or(!PRESETS.contains(&seconds))
+    });
+    ui.small("刷新");
+    egui::ComboBox::from_id_salt("hid-refresh-interval")
+        .selected_text(if custom {
+            "自定义".into()
+        } else {
+            format!("{seconds}s")
+        })
+        .width(72.0)
+        .show_ui(ui, |ui| {
+            for value in PRESETS {
+                if ui
+                    .selectable_label(!custom && seconds == value, format!("{value}s"))
+                    .clicked()
+                {
+                    seconds = value;
+                    custom = false;
+                }
+            }
+            if ui.selectable_label(custom, "自定义").clicked() {
+                custom = true;
+            }
+        });
+    ui.ctx().data_mut(|d| d.insert_temp(custom_id, custom));
+    if custom {
+        ui.add(
+            egui::DragValue::new(&mut seconds)
+                .range(1..=crate::hid::MAX_REFRESH_SECS)
+                .suffix("s")
+                .speed(1.0),
+        )
+        .on_hover_text("输入 1–3600 秒，或拖动数值调整");
+    }
+    if seconds != before {
+        settings
+            .hid_refresh_seconds
+            .insert(id.into(), crate::hid::refresh_seconds(seconds));
+    }
+}
+
 impl App {
+    /// 【新增】普通顶栏、歌词、侧边停靠和排列预览共享同一可见性判断。
+    pub(crate) fn island_battery_visible(&self) -> bool {
+        self.settings.show_battery
+            && (self.settings.battery_pinned || self.resident_power.0.is_some())
+    }
     /// 【新增】iOS 风格的多设备列表；四行可见，更多设备在内容区滚动。
     pub(crate) fn page_device_battery(&mut self, c: &Card) {
         let devices: Vec<_> = self

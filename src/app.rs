@@ -1389,7 +1389,7 @@ impl App {
     pub(crate) fn pet_space(&self)->f32 {if self.pet_enabled(){44.0}else{0.0}}
     fn lyric_focus_space(&self)->f32 {if self.pomo.running{crate::focus_bar::LYRIC_WIDTH+10.0}else{0.0}}
     /// 【新增】歌词模式单独预留电量位置，不能依赖会被整体淡出的普通顶栏。
-    fn lyric_battery_space(&self)->f32 {if self.settings.show_battery && self.resident_power.0.is_some(){32.0}else{0.0}}
+    fn lyric_battery_space(&self)->f32 {if self.island_battery_visible(){32.0}else{0.0}}
     fn lyric_bar_width(&self)->f32 {(LYRIC_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()+self.lyric_battery_space()).min(PW)}
     fn lyric_content_width(&self)->f32 {self.lyric_bar_width()-self.lyric_focus_space()-self.lyric_battery_space()-if self.pet_enabled(){48.0}else{0.0}}
     fn notice_size(&self,a:&Alert)->(f32,f32) {
@@ -1489,7 +1489,7 @@ impl App {
         let bell=self.t<self.notification_bell_until&&!self.compact_notices();
         // 【修改】移除仅依赖本机电池的显示判断，三类设备共用所选电量。
         self.resident_power=self.device_battery.power(&self.settings);
-        let mut layout=Layout::new(self.settings.show_battery&&self.resident_power.0.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled());
+        let mut layout=Layout::new(self.island_battery_visible(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled());
         layout.reorder(&self.settings.resident_order);
         for (position,extra) in self.quota_balance_layout(&ctx){layout.balance_tail(position,extra);}
         if self.settings.clock_period!=0 { layout.widen_clock(40.0); }
@@ -2237,7 +2237,7 @@ impl App {
         let base=&header;
         let m = anim::ease_in_out(smoothstep(0.0, 0.85, p));
         let clock = self.settings.clock_text(&env.clock);
-        let show_battery=self.settings.show_battery && self.resident_power.0.is_some();
+        let show_battery=self.island_battery_visible();
 
         // 顶栏终点布局：[电池][日期][时钟] 作为一组整体居中
         let date_w = base.text_w(&env.date, size::DATE, W::Regular);

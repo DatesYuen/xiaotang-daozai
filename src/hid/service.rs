@@ -1,8 +1,10 @@
 //! 【新增】独立 HID 工作线程；开关、限频、取消与界面通信不依赖蓝牙监听。
+use super::polling::Polling;
 use super::{Failure, Snapshot};
+use std::collections::BTreeMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
@@ -11,6 +13,7 @@ pub struct Service {
     refresh: mpsc::SyncSender<()>,
     enabled: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    intervals: Arc<Mutex<BTreeMap<String, u32>>>,
 }
 impl Service {
     pub fn spawn(enabled: bool) -> Self {
@@ -18,6 +21,8 @@ impl Service {
         let (refresh, requests) = mpsc::sync_channel(1);
         let enabled = Arc::new(AtomicBool::new(enabled));
         let stopped = Arc::new(AtomicBool::new(false));
+        let intervals = Arc::new(Mutex::new(BTreeMap::new()));
+        let worker_intervals = intervals.clone();
         let (active, stop) = (enabled.clone(), stopped.clone());
         let startup_error = tx.clone();
         let worker = std::thread::Builder::new()
@@ -26,6 +31,7 @@ impl Service {
                 let mut last = None;
                 let mut generation = 0u64;
                 let mut previous_enabled = active.load(Ordering::Relaxed);
+                let mut polling = Polling::default();
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         return;
@@ -39,12 +45,32 @@ impl Service {
                     let enabled = active.load(Ordering::Relaxed);
                     let changed = enabled != previous_enabled;
                     previous_enabled = enabled;
-                    if !should_scan(last, now, enabled, requested, changed) {
+                    let configured = polling.configure(
+                        worker_intervals
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone(),
+                    );
+                    if !should_scan(
+                        last,
+                        now,
+                        enabled,
+                        requested,
+                        changed || configured,
+                        polling.due(now),
+                    ) {
                         continue;
                     }
                     generation += 1;
                     #[cfg(windows)]
-                    let mut snapshot = super::windows::collect(enabled, &active, &stop, generation);
+                    let mut snapshot = super::windows::collect_scheduled(
+                        enabled,
+                        &active,
+                        &stop,
+                        generation,
+                        &mut polling,
+                        changed || requested,
+                    );
                     #[cfg(not(windows))]
                     let mut snapshot = Snapshot {
                         error: Some(Failure::Unsupported),
@@ -77,6 +103,7 @@ impl Service {
             refresh,
             enabled,
             stopped,
+            intervals,
         }
     }
     pub fn set_enabled(&self, enabled: bool) {
@@ -87,6 +114,13 @@ impl Service {
     /// 请求可合并，连续点击不创建新线程或堆积无限扫描。
     pub fn refresh(&self) {
         let _ = self.refresh.try_send(());
+    }
+    /// 【新增】设置改变即时生效；工作线程独立读取配置，不在界面线程访问设备。
+    pub fn set_intervals(&self, intervals: &BTreeMap<String, u32>) {
+        let mut current = self.intervals.lock().unwrap_or_else(|e| e.into_inner());
+        if *current != *intervals {
+            *current = intervals.clone();
+        }
     }
 }
 impl Drop for Service {
@@ -101,6 +135,7 @@ fn should_scan(
     enabled: bool,
     requested: bool,
     changed: bool,
+    due: bool,
 ) -> bool {
     if changed {
         return true;
@@ -109,7 +144,8 @@ fn should_scan(
     if requested {
         return elapsed.is_none_or(|age| age >= Duration::from_secs(5));
     }
-    enabled && elapsed.is_none_or(|age| age >= Duration::from_secs(60))
+    // 【修改】5 秒重新枚举一次接口；自定义到期的设备可提前唤起，不将间隔取整到 5 秒。
+    enabled && (due || elapsed.is_none_or(|age| age >= Duration::from_secs(5)))
 }
 
 #[cfg(test)]
@@ -118,31 +154,51 @@ mod tests {
     #[test]
     fn polling_is_bounded_and_switches_override_cooldown() {
         let now = Instant::now();
-        assert!(should_scan(None, now, true, false, false));
-        assert!(!should_scan(Some(now), now, true, true, false));
+        assert!(should_scan(None, now, true, false, false, false));
+        assert!(!should_scan(Some(now), now, true, true, false, false));
         assert!(should_scan(
             Some(now),
             now + Duration::from_secs(5),
             true,
             true,
+            false,
             false
         ));
         assert!(!should_scan(
             Some(now),
-            now + Duration::from_secs(59),
+            now + Duration::from_secs(4),
             true,
+            false,
             false,
             false
         ));
         assert!(should_scan(
             Some(now),
-            now + Duration::from_secs(60),
+            now + Duration::from_secs(5),
             true,
+            false,
             false,
             false
         ));
-        assert!(!should_scan(None, now, false, false, false));
-        assert!(should_scan(Some(now), now, false, false, true));
+        // 自定义 1 秒的设备可提前采样，但不会绕过手动刷新限频。
+        assert!(should_scan(
+            Some(now),
+            now + Duration::from_secs(1),
+            true,
+            false,
+            false,
+            true
+        ));
+        assert!(!should_scan(
+            Some(now),
+            now + Duration::from_secs(1),
+            true,
+            true,
+            false,
+            true
+        ));
+        assert!(!should_scan(None, now, false, false, false, false));
+        assert!(should_scan(Some(now), now, false, false, true, false));
     }
     #[test]
     fn drop_wakes_and_cancels_worker() {
@@ -154,6 +210,7 @@ mod tests {
             refresh,
             enabled: Arc::new(AtomicBool::new(true)),
             stopped: stopped.clone(),
+            intervals: Default::default(),
         });
         assert!(stopped.load(Ordering::Relaxed));
     }

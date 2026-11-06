@@ -362,16 +362,40 @@ fn base_device(info: &DeviceInfo, descriptor: Descriptor) -> Device {
     }
 }
 
+#[cfg(test)]
 pub(super) fn collect(
     enabled: bool,
     active: &AtomicBool,
     stopped: &AtomicBool,
     generation: u64,
 ) -> Snapshot {
+    collect_scheduled(
+        enabled,
+        active,
+        stopped,
+        generation,
+        &mut super::polling::Polling::default(),
+        true,
+    )
+}
+
+/// 【新增】每轮只查询到期接口；其余设备复用原始采样及时间戳，拔出后清除缓存。
+pub(super) fn collect_scheduled(
+    enabled: bool,
+    active: &AtomicBool,
+    stopped: &AtomicBool,
+    generation: u64,
+    polling: &mut super::polling::Polling,
+    force: bool,
+) -> Snapshot {
     let mut snapshot = Snapshot::default();
+    if !enabled {
+        polling.clear();
+    }
     let api = match HidApi::new() {
         Ok(api) => api,
         Err(_) => {
+            polling.clear();
             snapshot.error = Some(Failure::Io);
             return snapshot;
         }
@@ -393,19 +417,49 @@ pub(super) fn collect(
         catalog[..count].rotate_left(generation as usize % count);
     }
     let round_deadline = Instant::now() + Duration::from_secs(12);
+    let mut present = Vec::new();
     for (info, descriptor) in catalog {
         if stopped.load(Ordering::Relaxed) {
             break;
         }
         let candidates = protocols::candidates(&descriptor);
         let mut device = base_device(info, descriptor);
+        present.push(device.id.clone());
+        if candidates.is_empty() {
+            if !enabled {
+                device.failure = Some(Failure::Disabled);
+            }
+            snapshot.devices.push(device);
+            continue;
+        }
+        // 【修改】先标识已匹配协议，访问失败时仍可调整该接收器的采样间隔。
+        device.protocol = candidates[0].label();
+        device.transport = if candidates
+            .iter()
+            .any(|p| matches!(p, Protocol::Compx { .. }))
+        {
+            if device.descriptor.pid == 0xfb3d {
+                "USB"
+            } else {
+                "2.4G"
+            }
+        } else if candidates.contains(&Protocol::Hidpp) {
+            "HID++"
+        } else {
+            "HID"
+        };
         if !enabled {
             device.failure = Some(Failure::Disabled);
             snapshot.devices.push(device);
             continue;
         }
-        if candidates.is_empty() {
-            snapshot.devices.push(device);
+        let wireless = device.transport == "2.4G";
+        if let Some((cached, sample)) = polling.cached(&device.id, wireless, Instant::now(), force)
+        {
+            for d in &cached {
+                snapshot.samples.insert(d.id.clone(), sample);
+            }
+            snapshot.devices.extend(cached);
             continue;
         }
         let deadline = (Instant::now() + Duration::from_secs(4)).min(round_deadline);
@@ -416,6 +470,14 @@ pub(super) fn collect(
         };
         if let Err(error) = budget.check() {
             device.failure = Some(error);
+            let sample = polling.store(
+                device.id.clone(),
+                wireless,
+                vec![device.clone()],
+                Instant::now(),
+                unix_now(),
+            );
+            snapshot.samples.insert(device.id.clone(), sample);
             snapshot.devices.push(device);
             continue;
         }
@@ -492,16 +554,30 @@ pub(super) fn collect(
                 Protocol::Standard => {}
             }
         }
-        if slots.is_empty() {
-            snapshot.devices.push(device);
+        let id = device.id.clone();
+        let devices = if slots.is_empty() {
+            vec![device]
         } else {
-            snapshot.devices.extend(slots);
+            slots
+        };
+        let sample = polling.store(id, wireless, devices.clone(), Instant::now(), unix_now());
+        for d in &devices {
+            snapshot.samples.insert(d.id.clone(), sample);
         }
+        snapshot.devices.extend(devices);
     }
     if !enabled {
         snapshot.error = Some(Failure::Disabled);
     }
+    polling.retain(&present);
     snapshot
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
