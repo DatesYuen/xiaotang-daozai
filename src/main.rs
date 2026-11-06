@@ -47,6 +47,10 @@ struct Shell {
     bt_rx: Option<daozai::bt::Service>,
     bt: Vec<daozai::bt::Device>,
     bt_ready: bool,
+    /// 【新增】HID 服务独立于蓝牙通知；只把 Arc 快照交给界面。
+    #[cfg(windows)]
+    hid_service: daozai::hid::Service,
+    hid_snapshot: std::sync::Arc<daozai::hid::Snapshot>,
     volume_quiet: PollClock,
     /// v0.5.5：邮件收信服务（工作线程），以及上次同步给它的账号/开关快照。
     mail: daozai::mail::Service,
@@ -94,6 +98,8 @@ impl Shell {
         // 音频、网络与输入法查询由后台完成，避免首帧等待系统服务。
         diagnostics::startup("创建后台采样与窗口");
         let initial_input=None;
+        #[cfg(windows)]
+        let hid_service=daozai::hid::Service::spawn(app.settings.hid_battery);
         #[cfg(windows)] let system_state=daozai::system::Snapshot::default();
         #[cfg(windows)] let system_rx=daozai::system::observe(cc.egui_ctx.clone(),system_state.clone(),initial_input);
         Self {
@@ -128,6 +134,8 @@ impl Shell {
             bt_rx: None,
             bt: Vec::new(),
             bt_ready: false,
+            #[cfg(windows)] hid_service,
+            hid_snapshot: Default::default(),
             volume_quiet: PollClock::default(),
             mail: daozai::mail::Service::start(),
             mail_sig: (false, 0, Vec::new()),
@@ -205,6 +213,7 @@ impl Shell {
             volume: self.system_state.volume,
             bt: self.bt.clone(),
             bt_ready: self.bt_ready,
+            hid: self.hid_snapshot.clone(),
         }
     }
 }
@@ -277,16 +286,14 @@ impl eframe::App for Shell {
                 self.fullscreen=observation.fullscreen;
             }
             self.hidden=daozai::display_layout::hide_for_fullscreen(self.app.settings.hide_fullscreen,self.fullscreen,daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id).map(|d|d.bounds));
-            if self.app.settings.bluetooth_notifications {
-                if self.bt_rx.is_none() {self.bt_rx=Some(daozai::bt::spawn());}
-            } else {
-                self.bt_rx=None;
-                self.bt.clear();
-                self.bt_ready=false;
-            }
+            // 【修改】蓝牙电量持续供设备管理使用；通知开关仅控制连接/断开提醒。
+            if self.bt_rx.is_none() {self.bt_rx=Some(daozai::bt::spawn());}
             if let Some(service)=&self.bt_rx {
                 while let Ok(found)=service.rx.try_recv(){ self.bt=found; self.bt_ready=true; }
             }
+            // 【新增】独立接收 HID 结果，关闭蓝牙不会停止 HID 电量采集。
+            self.hid_service.set_enabled(self.app.settings.hid_battery);
+            while let Ok(found)=self.hid_service.rx.try_recv(){self.hid_snapshot=found;}
             if let Some(rx)=&self.incoming {
                 while let Ok(event)=rx.try_recv(){match event {daozai::system::Incoming::Revoked=>{self.app.settings.read_notifications=false;self.app.settings.save();},daozai::system::Incoming::Status(s)=>self.app.listener_status=s,daozai::system::Incoming::Message(a,id,b)=>self.app.receive_notification(a,id,b)}}
             }
@@ -393,6 +400,9 @@ impl eframe::App for Shell {
                     self.volume_quiet=PollClock::now();
                 },
                 Cmd::Copy(text)=>{ctx.copy_text(text);self.app.say("已复制");},
+                Cmd::HidRefresh=>{
+                    #[cfg(windows)] self.hid_service.refresh();
+                },
                 Cmd::Notify(title,body)=>{
                     #[cfg(windows)] if let Some(tray)=&self.tray{tray.notify(&title,&body,self.app.settings.sound);}
                 },
