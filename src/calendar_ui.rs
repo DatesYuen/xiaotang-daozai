@@ -46,6 +46,7 @@ impl Source<'_> {
         match self {
             Self::Calendar(Some(calendar::Provider::WeCom))=>Color32::from_rgb(105,208,157),
             Self::Calendar(Some(calendar::Provider::DingTalk))=>Color32::from_rgb(77,192,242),
+            Self::Calendar(Some(calendar::Provider::ICloud))=>Color32::from_rgb(255,105,97),
             Self::Calendar(_)=>Color32::from_rgb(112,162,255),
             Self::Mail(_)=>Color32::from_rgb(199,168,255),
             Self::Local=>Color32::from_rgb(105,208,157),
@@ -124,7 +125,7 @@ pub(crate) fn source_icon(c:&Card,source:Source<'_>,x:f32,y:f32,size:f32) {
     let pixels=(rect.width()*c.ui.ctx().pixels_per_point()).ceil() as u32;
     let icon=egui::Image::from_bytes(format!("{uri}/{pixels}.svg"),bytes);
     if let Ok(egui::load::TexturePoll::Ready{texture})=icon.fit_to_exact_size(rect.size()).load_for_size(c.ui.ctx(),rect.size()) {
-        let tint=if matches!(source,Source::Calendar(None)|Source::Local){source.color()}else{Color32::WHITE};
+        let tint=if matches!(source,Source::Calendar(None|Some(calendar::Provider::ICloud|calendar::Provider::Custom|calendar::Provider::Exchange))|Source::Local){source.color()}else{Color32::WHITE};
         c.painter.image(texture.id,rect,egui::Rect::from_min_max(egui::Pos2::ZERO,egui::pos2(1.0,1.0)),tint);
     }
 }
@@ -200,7 +201,7 @@ impl App {
 
     pub(crate) fn select_calendar_day(&mut self, day:NaiveDate) {
         let month=calendar::month_start(day);
-        if month!=self.calendar.view.month {self.calendar.view.month=month;self.calendar.view.loading=false;}
+        if month!=self.calendar.view.month {self.calendar.view.month=month;self.calendar.view.loading=false;self.calendar.view.error.clear();}
         self.calendar.view.day=day;
         self.calendar.view.show_ended=day<chrono::Local::now().date_naive();
         self.calendar.view.focus=None;
@@ -212,7 +213,7 @@ impl App {
     pub(crate) fn request_calendar_month(&mut self, force:bool) {
         let has_accounts=!self.calendar_configs().is_empty();
         let view=&mut self.calendar.view;
-        if !has_accounts || !force && (view.loaded==Some(view.month) || view.loading){return;}
+        if !has_accounts || !force && (view.loaded==Some(view.month) || view.loading || !view.error.is_empty()){return;}
         view.loading=true;view.error.clear();
         for feed in &mut self.calendar.feeds {feed.month.loading=true;feed.month.error.clear();}
         self.pending.push(Cmd::CalendarMonth(view.month));
@@ -294,7 +295,8 @@ impl App {
         c.text(167.0,44.0,&heading,8.8,W::Semibold,accent,H::Left);
         let status=if self.calendar.view.loading{"同步中".to_string()}else if !self.calendar.view.error.is_empty(){"重试同步".to_string()}else {let at=self.calendar.feeds.iter().map(|feed|feed.last_sync.as_str()).max().unwrap_or(&self.calendar.last_sync);if at.is_empty(){"".into()}else{format!("{} 更新",at.split_whitespace().last().unwrap_or(""))}};
         c.text(376.0,44.0,&status,7.4,W::Regular,muted,H::Right);
-        if !self.calendar_configs().is_empty() && !self.calendar.view.loading && c.hit(326.0,33.0,52.0,15.0,"calendar-sync").on_hover_text("同步这个月份").clicked(){self.request_calendar_month(true);}
+        let sync_hint=if self.calendar.view.error.is_empty(){"同步这个月份"}else{self.calendar.view.error.as_str()};
+        if !self.calendar_configs().is_empty() && !self.calendar.view.loading && c.hit(326.0,33.0,52.0,15.0,"calendar-sync").on_hover_text(sync_hint).clicked(){self.request_calendar_month(true);}
         let focus=self.calendar.view.focus.clone();
         let scroll_to_focus=if c.live{std::mem::take(&mut self.calendar.view.scroll_to_focus)}else{false};
         let mut first=self.calendar.view.first;

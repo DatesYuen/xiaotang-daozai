@@ -25,6 +25,37 @@ impl App {
         })();
         if let Err(error)=result{draft.error=error;self.calendar.draft=Some(draft);}
     }
+    /// 导入 .ics 文件到本机日程：过去 30 天到未来一年，重复日程展开；同一日程再次导入会跳过。
+    pub fn import_ics(&mut self,files:&[(String,String)])->String{
+        if !self.calendar.local_error.is_empty(){return self.calendar.local_error.clone();}
+        let now=chrono::Utc::now();
+        let (lo,hi)=(now-chrono::Duration::days(30),now+chrono::Duration::days(366));
+        let mut entries=self.calendar.local.clone();
+        let (mut added,mut skipped,mut errors)=(0usize,0usize,Vec::new());
+        for (name,text) in files {
+            match crate::calendar::events_from_ics(text,lo,hi) {
+                Ok(events)=>for mut event in events {
+                    if entries.len()>=5000 {skipped+=1;continue;}
+                    event.uid=format!("ics-{}-{}",event.uid,event.start);
+                    if entries.iter().any(|e|e.event.uid==event.uid){skipped+=1;continue;}
+                    let end=event.end.filter(|end|*end>event.start).unwrap_or(event.start+if event.all_day{86400}else{3600});
+                    event.end=Some(end);
+                    let reminder=(!event.all_day).then_some(15);
+                    entries.push(local_calendar::Entry{event,reminder});added+=1;
+                },
+                Err(error)=>errors.push(format!("{name}：{error}")),
+            }
+        }
+        if added>0 {
+            if let Err(error)=local_calendar::save(&entries){return error;}
+            self.calendar.local=entries;
+        }
+        let mut note=if added>0{format!("已导入 {added} 个日程")}else if errors.is_empty(){"文件里没有可导入的日程（只导入过去 30 天到未来一年）".into()}else{String::new()};
+        if skipped>0{note.push_str(&format!("，{skipped} 个已存在已跳过"));}
+        if !errors.is_empty(){if !note.is_empty(){note.push('；');}note.push_str(&errors.join("；"));}
+        self.calendar.import_note=note.clone();
+        note
+    }
     fn delete_calendar_editor(&mut self){
         let Some(draft)=self.calendar.draft.as_mut() else{return;};
         let Some(uid)=draft.uid.as_ref() else{return;};
