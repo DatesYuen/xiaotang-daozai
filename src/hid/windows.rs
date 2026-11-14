@@ -234,6 +234,8 @@ struct Session<'a> {
     device: HidDevice,
     path: &'a CStr,
     budget: Budget<'a>,
+    /// 【新增】跨集合协议的第二读通道（雷柏：写 col04、读 col05）。
+    companion: Option<HidDevice>,
 }
 impl Io for Session<'_> {
     fn check(&self) -> Result<(), Failure> {
@@ -274,6 +276,28 @@ impl Io for Session<'_> {
         self.check()?;
         Ok(buffer[..len].to_vec())
     }
+    fn read_companion(&mut self, timeout: Duration) -> Result<Vec<u8>, Failure> {
+        self.check()?;
+        let companion = self.companion.as_ref().ok_or(Failure::Unsupported)?;
+        let mut buffer = [0u8; 64];
+        let len = companion
+            .read_timeout(&mut buffer, timeout.as_millis().min(100) as i32)
+            .map_err(|_| Failure::Io)?;
+        self.check()?;
+        Ok(buffer[..len].to_vec())
+    }
+}
+
+/// 【新增】雷柏回复只投递到 col05(FF00/0002) 的输入管道；必须在写入前打开，避免丢帧。
+fn companion_reader(api: &HidApi, info: &DeviceInfo) -> Option<HidDevice> {
+    api.device_list()
+        .find(|other| {
+            other.vendor_id() == info.vendor_id()
+                && other.product_id() == info.product_id()
+                && other.usage_page() == 0xff00
+                && other.usage() == 0x0002
+        })
+        .and_then(|target| target.open_device(api).ok())
 }
 
 fn describe(info: &DeviceInfo) -> Descriptor {
@@ -436,7 +460,7 @@ pub(super) fn collect_scheduled(
         device.protocol = candidates[0].label();
         device.transport = if candidates
             .iter()
-            .any(|p| matches!(p, Protocol::Compx { .. }))
+            .any(|p| matches!(p, Protocol::Compx { .. } | Protocol::Rapoo | Protocol::Bytech))
         {
             if device.descriptor.pid == 0xfb3d {
                 "USB"
@@ -505,6 +529,12 @@ pub(super) fn collect_scheduled(
                     continue;
                 }
             };
+            // 【新增】雷柏的回复走另一个集合，先打开读通道再发查询，避免丢帧。
+            let companion = if protocol == Protocol::Rapoo {
+                companion_reader(&api, info)
+            } else {
+                None
+            };
             let mut session = Session {
                 device: handle,
                 path: info.path(),
@@ -513,6 +543,7 @@ pub(super) fn collect_scheduled(
                     stopped,
                     deadline,
                 },
+                companion,
             };
             match protocol {
                 Protocol::Compx { online } => {
@@ -522,6 +553,26 @@ pub(super) fn collect_scheduled(
                         "2.4G"
                     };
                     match protocols::read_compx(&mut session, online) {
+                        Ok(b) => {
+                            device.battery = Some(b);
+                            device.failure = None;
+                        }
+                        Err(e) => device.failure = Some(e),
+                    }
+                }
+                Protocol::Rapoo => {
+                    device.transport = "2.4G";
+                    match protocols::read_rapoo(&mut session) {
+                        Ok(b) => {
+                            device.battery = Some(b);
+                            device.failure = None;
+                        }
+                        Err(e) => device.failure = Some(e),
+                    }
+                }
+                Protocol::Bytech => {
+                    device.transport = "2.4G";
+                    match protocols::read_bytech(&mut session) {
                         Ok(b) => {
                             device.battery = Some(b);
                             device.failure = None;

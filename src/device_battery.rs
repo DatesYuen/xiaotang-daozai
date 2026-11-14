@@ -97,7 +97,8 @@ impl State {
                 (1, 2) => DeviceKind::Mouse,
                 (1, 6) => DeviceKind::Keyboard,
                 (1, 4 | 5) => DeviceKind::Gamepad,
-                _ if d.protocol == "compx-17" => DeviceKind::Mouse,
+                _ if d.protocol == "compx-17" || d.protocol == "rapoo-x2" => DeviceKind::Mouse,
+                _ if d.protocol == "bytech-65" => DeviceKind::Keyboard,
                 _ => DeviceKind::Other,
             };
             let name = d
