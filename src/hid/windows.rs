@@ -234,6 +234,8 @@ struct Session<'a> {
     device: HidDevice,
     path: &'a CStr,
     budget: Budget<'a>,
+    /// 【新增】跨集合协议的第二读通道（雷柏：写 col04、读 col05）。
+    companion: Option<HidDevice>,
 }
 impl Io for Session<'_> {
     fn check(&self) -> Result<(), Failure> {
@@ -274,6 +276,35 @@ impl Io for Session<'_> {
         self.check()?;
         Ok(buffer[..len].to_vec())
     }
+    fn read_companion(&mut self, timeout: Duration) -> Result<Vec<u8>, Failure> {
+        self.check()?;
+        let companion = self.companion.as_ref().ok_or(Failure::Unsupported)?;
+        let mut buffer = [0u8; 64];
+        let len = companion
+            .read_timeout(&mut buffer, timeout.as_millis().min(100) as i32)
+            .map_err(|_| Failure::Io)?;
+        self.check()?;
+        Ok(buffer[..len].to_vec())
+    }
+}
+
+/// 【新增】雷柏回复只投递到 FF00/0002 中输入长度匹配的那个集合（接收器/有线本体
+/// 都有一个 in=7 的回复口和一个 in=10 的同级集合）；按长度精确挑选，必须在写入前
+/// 打开，避免丢帧。
+fn companion_reader(api: &HidApi, info: &DeviceInfo, expected_input: u16) -> Option<HidDevice> {
+    api.device_list()
+        .filter(|other| {
+            other.vendor_id() == info.vendor_id()
+                && other.product_id() == info.product_id()
+                && other.usage_page() == 0xff00
+                && other.usage() == 0x0002
+        })
+        .find(|other| {
+            Native::open(other.path())
+                .map(|native| native.caps.InputReportByteLength == expected_input)
+                .unwrap_or(false)
+        })
+        .and_then(|target| target.open_device(api).ok())
 }
 
 fn describe(info: &DeviceInfo) -> Descriptor {
@@ -436,9 +467,9 @@ pub(super) fn collect_scheduled(
         device.protocol = candidates[0].label();
         device.transport = if candidates
             .iter()
-            .any(|p| matches!(p, Protocol::Compx { .. }))
+            .any(|p| matches!(p, Protocol::Compx { .. } | Protocol::Rapoo | Protocol::Bytech))
         {
-            if device.descriptor.pid == 0xfb3d {
+            if device.descriptor.pid == 0xfb3d || device.descriptor.pid == 0x4415 {
                 "USB"
             } else {
                 "2.4G"
@@ -505,6 +536,12 @@ pub(super) fn collect_scheduled(
                     continue;
                 }
             };
+            // 【新增】雷柏的回复走另一个集合，先按输入长度挑中回复口再发查询，避免丢帧。
+            let companion = if protocol == Protocol::Rapoo {
+                companion_reader(&api, info, 7)
+            } else {
+                None
+            };
             let mut session = Session {
                 device: handle,
                 path: info.path(),
@@ -513,6 +550,7 @@ pub(super) fn collect_scheduled(
                     stopped,
                     deadline,
                 },
+                companion,
             };
             match protocol {
                 Protocol::Compx { online } => {
@@ -522,6 +560,30 @@ pub(super) fn collect_scheduled(
                         "2.4G"
                     };
                     match protocols::read_compx(&mut session, online) {
+                        Ok(b) => {
+                            device.battery = Some(b);
+                            device.failure = None;
+                        }
+                        Err(e) => device.failure = Some(e),
+                    }
+                }
+                Protocol::Rapoo => {
+                    device.transport = if device.descriptor.pid == 0x4415 {
+                        "USB"
+                    } else {
+                        "2.4G"
+                    };
+                    match protocols::read_rapoo(&mut session) {
+                        Ok(b) => {
+                            device.battery = Some(b);
+                            device.failure = None;
+                        }
+                        Err(e) => device.failure = Some(e),
+                    }
+                }
+                Protocol::Bytech => {
+                    device.transport = "2.4G";
+                    match protocols::read_bytech(&mut session) {
                         Ok(b) => {
                             device.battery = Some(b);
                             device.failure = None;
@@ -555,12 +617,35 @@ pub(super) fn collect_scheduled(
             }
         }
         let id = device.id.clone();
-        let devices = if slots.is_empty() {
+        let mut devices = if slots.is_empty() {
             vec![device]
         } else {
             slots
         };
-        let sample = polling.store(id, wireless, devices.clone(), Instant::now(), unix_now());
+        // 【新增】无线查询偶发不回包（雷柏实测约 1/40）或设备休眠时，接收器只是静默，
+        // 不代表读数作废。保留最近一次成功电量并沿用其采样时刻，让既有过期机制决定
+        // 何时降级为「读数已过期」；接收器明确报离线（Offline）时不受影响。
+        let mut sampled_at = unix_now();
+        if devices.len() == 1
+            && devices[0].battery.is_none()
+            && devices[0].failure == Some(Failure::Timeout)
+        {
+            if let Some((good, at)) = polling.last_good(&id) {
+                let grace =
+                    (u64::from(polling.interval(&id, wireless)) * 2 + 12).max(120);
+                if unix_now().saturating_sub(at) <= grace {
+                    devices = good.to_vec();
+                    sampled_at = at;
+                }
+            }
+        }
+        if devices
+            .iter()
+            .any(|d| d.battery.is_some() && d.failure.is_none())
+        {
+            polling.remember_good(&id, &devices, sampled_at);
+        }
+        let sample = polling.store(id, wireless, devices.clone(), Instant::now(), sampled_at);
         for d in &devices {
             snapshot.samples.insert(d.id.clone(), sample);
         }
