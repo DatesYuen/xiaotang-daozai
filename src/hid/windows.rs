@@ -288,14 +288,21 @@ impl Io for Session<'_> {
     }
 }
 
-/// 【新增】雷柏回复只投递到 col05(FF00/0002) 的输入管道；必须在写入前打开，避免丢帧。
-fn companion_reader(api: &HidApi, info: &DeviceInfo) -> Option<HidDevice> {
+/// 【新增】雷柏回复只投递到 FF00/0002 中输入长度匹配的那个集合（接收器/有线本体
+/// 都有一个 in=7 的回复口和一个 in=10 的同级集合）；按长度精确挑选，必须在写入前
+/// 打开，避免丢帧。
+fn companion_reader(api: &HidApi, info: &DeviceInfo, expected_input: u16) -> Option<HidDevice> {
     api.device_list()
-        .find(|other| {
+        .filter(|other| {
             other.vendor_id() == info.vendor_id()
                 && other.product_id() == info.product_id()
                 && other.usage_page() == 0xff00
                 && other.usage() == 0x0002
+        })
+        .find(|other| {
+            Native::open(other.path())
+                .map(|native| native.caps.InputReportByteLength == expected_input)
+                .unwrap_or(false)
         })
         .and_then(|target| target.open_device(api).ok())
 }
@@ -462,7 +469,7 @@ pub(super) fn collect_scheduled(
             .iter()
             .any(|p| matches!(p, Protocol::Compx { .. } | Protocol::Rapoo | Protocol::Bytech))
         {
-            if device.descriptor.pid == 0xfb3d {
+            if device.descriptor.pid == 0xfb3d || device.descriptor.pid == 0x4415 {
                 "USB"
             } else {
                 "2.4G"
@@ -529,9 +536,9 @@ pub(super) fn collect_scheduled(
                     continue;
                 }
             };
-            // 【新增】雷柏的回复走另一个集合，先打开读通道再发查询，避免丢帧。
+            // 【新增】雷柏的回复走另一个集合，先按输入长度挑中回复口再发查询，避免丢帧。
             let companion = if protocol == Protocol::Rapoo {
-                companion_reader(&api, info)
+                companion_reader(&api, info, 7)
             } else {
                 None
             };
@@ -561,7 +568,11 @@ pub(super) fn collect_scheduled(
                     }
                 }
                 Protocol::Rapoo => {
-                    device.transport = "2.4G";
+                    device.transport = if device.descriptor.pid == 0x4415 {
+                        "USB"
+                    } else {
+                        "2.4G"
+                    };
                     match protocols::read_rapoo(&mut session) {
                         Ok(b) => {
                             device.battery = Some(b);

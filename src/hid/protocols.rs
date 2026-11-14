@@ -46,7 +46,9 @@ pub(super) fn candidates(d: &Descriptor) -> Vec<Protocol> {
         result.push(Protocol::Hidpp);
     }
     // 【新增】雷柏 VT3PRO 等接收器：命令集合 col04(FF00/000E) 只写，回复从 col05(FF00/0002) 读。
-    if (d.vid, d.pid) == (0x24ae, 0x1215)
+    // 0x1215 = 2.4G 接收器；0x4415 = 插线后的有线本体（2026-11-15 实测同协议应答，回复字节5=02）。
+    if d.vid == 0x24ae
+        && matches!(d.pid, 0x1215 | 0x4415)
         && d.usage_page == 0xff00
         && d.usage == 0x000e
         && d.output_len == 32
@@ -344,7 +346,7 @@ mod tests {
     }
     #[test]
     fn rapoo_and_bytech_register_only_on_measured_collections() {
-        // 雷柏：命令集合 col04(FF00/000E, 输出 32B)；其他集合/长度/型号都不注册。
+        // 雷柏：命令集合 col04(FF00/000E, 输出 32B)；接收器 1215 与有线本体 4415。
         let mut d = Descriptor {
             vid: 0x24ae,
             pid: 0x1215,
@@ -353,6 +355,8 @@ mod tests {
             output_len: 32,
             ..Default::default()
         };
+        assert_eq!(candidates(&d), vec![Protocol::Rapoo]);
+        d.pid = 0x4415;
         assert_eq!(candidates(&d), vec![Protocol::Rapoo]);
         d.usage = 0x0002;
         assert!(candidates(&d).is_empty());
