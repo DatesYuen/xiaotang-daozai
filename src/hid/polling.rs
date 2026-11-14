@@ -21,6 +21,8 @@ struct Entry {
 pub(super) struct Polling {
     intervals: BTreeMap<String, u32>,
     entries: BTreeMap<String, Entry>,
+    /// 【新增】最近一次成功读数；本轮偶发未回复时用于顶住显示，过期机制照常生效。
+    goods: BTreeMap<String, (Vec<Device>, u64)>,
 }
 impl Polling {
     pub fn configure(&mut self, intervals: BTreeMap<String, u32>) -> bool {
@@ -95,9 +97,24 @@ impl Polling {
     }
     pub fn retain(&mut self, present: &[String]) {
         self.entries.retain(|id, _| present.contains(id));
+        self.goods.retain(|id, _| present.contains(id));
     }
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.goods.clear();
+    }
+    /// 【新增】只在整轮成功拿到电量时记录；供下一轮偶发未回复时顶住显示。
+    pub fn remember_good(&mut self, id: &str, devices: &[Device], sampled_at: u64) {
+        if devices
+            .iter()
+            .any(|d| d.battery.is_some() && d.failure.is_none())
+        {
+            self.goods
+                .insert(id.to_string(), (devices.to_vec(), sampled_at));
+        }
+    }
+    pub fn last_good(&self, id: &str) -> Option<(&[Device], u64)> {
+        self.goods.get(id).map(|(devices, at)| (devices.as_slice(), *at))
     }
 }
 
@@ -152,5 +169,40 @@ mod tests {
         assert!(!p.due(now + Duration::from_secs(4000)));
         assert_eq!(refresh_seconds(0), 1);
         assert_eq!(refresh_seconds(u32::MAX), 3600);
+    }
+    #[test]
+    fn last_good_keeps_successful_sample_until_removal() {
+        use crate::hid::{Battery, Failure};
+        let now = Instant::now();
+        let mut p = Polling::default();
+        // 没有成功读数前不提供顶住值。
+        p.store("a".into(), true, vec![device("a")], now, 100);
+        assert!(p.last_good("a").is_none());
+        // 成功读数记录后可取回，断开设备后随条目一起清除。
+        let mut good = device("a");
+        good.battery = Some(Battery {
+            percent: 76,
+            charging: None,
+            millivolts: None,
+        });
+        p.remember_good("a", std::slice::from_ref(&good), 500);
+        let (devices, at) = p.last_good("a").unwrap();
+        assert_eq!(devices[0].battery.map(|b| b.percent), Some(76));
+        assert_eq!(at, 500);
+        p.retain(&[]);
+        assert!(p.last_good("a").is_none());
+        // 无电量的轮次不算成功，不覆盖既有顶住值。
+        let mut p = Polling::default();
+        let mut good = device("a");
+        good.battery = Some(Battery {
+            percent: 50,
+            charging: None,
+            millivolts: None,
+        });
+        p.remember_good("a", std::slice::from_ref(&good), 100);
+        let mut bad = device("a");
+        bad.failure = Some(Failure::Timeout);
+        p.remember_good("a", std::slice::from_ref(&bad), 900);
+        assert_eq!(p.last_good("a").unwrap().1, 100);
     }
 }

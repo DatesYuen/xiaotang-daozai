@@ -606,12 +606,35 @@ pub(super) fn collect_scheduled(
             }
         }
         let id = device.id.clone();
-        let devices = if slots.is_empty() {
+        let mut devices = if slots.is_empty() {
             vec![device]
         } else {
             slots
         };
-        let sample = polling.store(id, wireless, devices.clone(), Instant::now(), unix_now());
+        // 【新增】无线查询偶发不回包（雷柏实测约 1/40）或设备休眠时，接收器只是静默，
+        // 不代表读数作废。保留最近一次成功电量并沿用其采样时刻，让既有过期机制决定
+        // 何时降级为「读数已过期」；接收器明确报离线（Offline）时不受影响。
+        let mut sampled_at = unix_now();
+        if devices.len() == 1
+            && devices[0].battery.is_none()
+            && devices[0].failure == Some(Failure::Timeout)
+        {
+            if let Some((good, at)) = polling.last_good(&id) {
+                let grace =
+                    (u64::from(polling.interval(&id, wireless)) * 2 + 12).max(120);
+                if unix_now().saturating_sub(at) <= grace {
+                    devices = good.to_vec();
+                    sampled_at = at;
+                }
+            }
+        }
+        if devices
+            .iter()
+            .any(|d| d.battery.is_some() && d.failure.is_none())
+        {
+            polling.remember_good(&id, &devices, sampled_at);
+        }
+        let sample = polling.store(id, wireless, devices.clone(), Instant::now(), sampled_at);
         for d in &devices {
             snapshot.samples.insert(d.id.clone(), sample);
         }
